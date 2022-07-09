@@ -37,8 +37,13 @@ def tune_build_wrapper(hp: kt.HyperParameters(), *args, **kwargs) -> tf.keras.Se
     return model
 
 
-def build_model(config, num_classes: int) -> tf.keras.Sequential:
-
+def build_model(config: dict[str, Any], num_classes: int) -> tf.keras.Sequential:
+    """
+    Build CNN classifier with input configuration parameters and number of classes
+    :param config: Model configuration parameters
+    :param num_classes: Number of input classes
+    :return: Compiled model
+    """
     conv_layer = partial(tf.keras.layers.Conv2D,
                          kernel_size=config["conv_kernel_size"],
                          strides=1,
@@ -125,7 +130,7 @@ def configure_img_dataset(dataset: tf.data.Dataset, class_names: np.array) -> tf
     """
     dataset = dataset.map(lambda x: preprocess_img_path(x, class_names), num_parallel_calls=tf.data.AUTOTUNE)
     dataset = dataset.cache()
-    dataset = dataset.shuffle(buffer_size=1000)
+    dataset = dataset.shuffle(buffer_size=1000, seed=SEED)
     dataset = dataset.batch(BATCH_SIZE)
     dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
     return dataset
@@ -138,6 +143,16 @@ def train(full_set: tf.data.Dataset,
           tune: bool = False,
           model_name: str = "unnamed_model",
           ) -> tf.keras.Sequential:
+    """
+    Train a TensorFlow classifier based on input dataset
+    :param full_set: Full training dataset
+    :param class_names: Numpy array of class names
+    :param val_split: Fraction to split full dataset to train and validation sets
+    :param epochs: Maximum number of epochs per training cycle
+    :param tune: Boolean to tune model hyperparameters
+    :param model_name: Name of model (only necessary when tuning)
+    :return: Fitted model
+    """
 
     train_set, val_set = split_dataset(full_set, split=val_split)
     train_set = configure_img_dataset(train_set, class_names)
