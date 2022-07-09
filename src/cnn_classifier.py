@@ -14,6 +14,8 @@ PREDICT_ONLY = False        # Use existing model to make prediction or train new
 SAVE_MODEL = True           # Save the newly trained model
 TUNE_MODEL = True           # Tune model hyperparameters or train a single model
 MAX_EPOCHS = 100            # Maximum number of epochs per training cycle
+TEST_SPLIT = 0.1            # Fraction of full dataset to be used for testing
+VAL_SPLIT = 0.15            # Fraction of training dataset (after testing split) to be used for validation
 
 
 def get_model_config(hp: kt.HyperParameters()) -> dict[str, Any]:
@@ -85,7 +87,7 @@ def split_dataset(dataset: tf.data.Dataset, split: float = 0.8) -> (tf.data.Data
     Split full dataset into two partitions, defined by input fraction
     :param dataset: Full dataset
     :param split: Fraction to split dataset between 0 and 1
-    :return: split dataset 1, split dataset 2
+    :return: dataset 1 (split), dataset 2 (1 - split)
     """
 
     assert 0 < split < 1
@@ -127,16 +129,20 @@ def preprocess_img_path(file_path: pathlib.Path, class_names: np.array) -> (tf.T
     return format_img(), get_label()
 
 
-def configure_img_dataset(dataset: tf.data.Dataset, class_names: np.array) -> tf.data.Dataset:
+def configure_img_dataset(dataset: tf.data.Dataset, class_names: np.array, shuffle: bool = True) -> tf.data.Dataset:
     """
     Configure file based image dataset with loading/preprocessing functionality and performance
     :param dataset: File based image dataset
     :param class_names: Numpy array of class names
+    :param shuffle: Option to randomise dataset, True by default
     :return: Configured dataset
     """
     dataset = dataset.map(lambda x: preprocess_img_path(x, class_names), num_parallel_calls=tf.data.AUTOTUNE)
+
+    if shuffle:
+        dataset = dataset.shuffle(buffer_size=1000, seed=SEED)
+
     dataset = dataset.cache()
-    dataset = dataset.shuffle(buffer_size=1000, seed=SEED)
     dataset = dataset.batch(BATCH_SIZE)
     dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
     return dataset
@@ -144,7 +150,7 @@ def configure_img_dataset(dataset: tf.data.Dataset, class_names: np.array) -> tf
 
 def train(full_set: tf.data.Dataset,
           class_names: np.array,
-          val_split: float = 0.8,
+          val_split: float = 0.2,
           epochs: int = 10,
           tune: bool = False,
           model_name: str = "unnamed_model",
@@ -160,7 +166,7 @@ def train(full_set: tf.data.Dataset,
     :return: Fitted model
     """
 
-    train_set, val_set = split_dataset(full_set, split=val_split)
+    val_set, train_set = split_dataset(full_set, split=val_split)
     train_set = configure_img_dataset(train_set, class_names)
     val_set = configure_img_dataset(val_set, class_names)
 
@@ -199,7 +205,6 @@ def get_file_dataset(dataset_path: pathlib.Path) -> (tf.data.Dataset, list[str])
     """
     print(f"Getting data from {dataset_path}")
     dataset = tf.data.Dataset.list_files(str(dataset_path.joinpath("*", "*")), shuffle=False)
-    dataset = dataset.shuffle(len(dataset), seed=SEED)
 
     class_names = np.array(sorted([item.name for item in dataset_path.glob("*") if os.path.isdir(item)]))
 
@@ -215,22 +220,29 @@ def main():
         raise NotADirectoryError(f"Dataset {DATASET_NAME} not found in {DATASET_DIR}")
 
     dataset, class_names = get_file_dataset(dataset_path)
-    train_set, test_set = split_dataset(dataset, split=0.9)
-    dataset = configure_img_dataset(dataset, class_names)
-    test_set = configure_img_dataset(test_set, class_names)
+    # Shuffle to ensure varied train and test sets
+    dataset = dataset.shuffle(len(dataset), seed=SEED)
+    test_set, train_set = split_dataset(dataset, split=TEST_SPLIT)
 
     if PREDICT_ONLY:
-        model_paths = list(MODEL_DIR.glob(f"{DATASET_NAME}_*"))
+        # Not sorted by default
+        model_paths = list(sorted(MODEL_DIR.glob(f"{DATASET_NAME}_*")))
+        latest_model = model_paths[-1]
 
         if not model_paths:
             raise FileNotFoundError(
                 f"No model found for dataset '{DATASET_NAME}' in {DATASET_DIR}, please train a model first"
             )
 
-        # Defaults to latest model
-        model = tf.keras.models.load_model(model_paths[-1])
+        print(f"Loading model for prediction: {latest_model}")
+        model = tf.keras.models.load_model(latest_model)
     else:
-        model = train(train_set, class_names, val_split=0.85, epochs=MAX_EPOCHS, tune=TUNE_MODEL, model_name=DATASET_NAME)
+        model = train(train_set,
+                      class_names=class_names,
+                      val_split=VAL_SPLIT,
+                      epochs=MAX_EPOCHS,
+                      tune=TUNE_MODEL,
+                      model_name=DATASET_NAME)
 
         if SAVE_MODEL:
             # Saving
@@ -238,6 +250,8 @@ def main():
             save_name = "_".join((DATASET_NAME, timestamp))
             model.save(pathlib.Path(MODEL_DIR, save_name))
 
+    dataset = configure_img_dataset(dataset, class_names, shuffle=False)
+    test_set = configure_img_dataset(test_set, class_names, shuffle=False)
     _, test_acc = model.evaluate(test_set, verbose=0)
     print(f"Test accuracy: {round(test_acc * 100, 2)}%")
     _, dataset_acc = model.evaluate(dataset, verbose=0)
