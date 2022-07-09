@@ -1,6 +1,5 @@
 import os
 import pathlib
-import argparse
 import keras_tuner as kt
 import tensorflow as tf
 import numpy as np
@@ -8,6 +7,13 @@ from datetime import datetime
 from functools import partial
 from typing import Any
 from src.settings import MODEL_DIR, DATASET_DIR, IMG_SIZE, BATCH_SIZE, SEED
+
+# Running options
+DATASET_NAME = "Flowers"    # Name of dataset with the data directory
+PREDICT_ONLY = False        # Use existing model to make prediction or train new model
+SAVE_MODEL = True           # Save the newly trained model
+TUNE_MODEL = True           # Tune model hyperparameters or train a single model
+MAX_EPOCHS = 100            # Maximum number of epochs per training cycle
 
 
 def get_model_config(hp: kt.HyperParameters()) -> dict[str, Any]:
@@ -69,7 +75,7 @@ def build_model(config: dict[str, Any], num_classes: int) -> tf.keras.Sequential
 
     model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=config["learning_rate"]),
                   loss=tf.keras.losses.SparseCategoricalCrossentropy(),
-                  metrics=["accuracy"])
+                  metrics=["sparse_categorical_accuracy"])
 
     return model
 
@@ -165,8 +171,8 @@ def train(full_set: tf.data.Dataset,
             partial(tune_build_wrapper, num_classes=len(class_names)),
             objective="val_loss",
             max_trials=10,
-            directory=MODEL_DIR,
-            project_name=f"{model_name}_tuned")
+            directory=MODEL_DIR / "tuning_results",
+            project_name=f"{model_name}")
 
         tuner.search(train_set, validation_data=val_set, epochs=epochs, callbacks=[val_loss_stop])
         model = tuner.get_best_models()[0]
@@ -200,55 +206,42 @@ def get_file_dataset(dataset_path: pathlib.Path) -> (tf.data.Dataset, list[str])
     return dataset, class_names
 
 
-def main(argv=None):
-
-    parser = argparse.ArgumentParser(description="Training a CNN based on specified dataset")
-
-    parser.add_argument("--dataset",
-                        default="Flowers",
-                        type=str,
-                        help=f"Specify dataset within dataset directory ({DATASET_DIR})",
-                        )
-
-    parser.add_argument("--epochs",
-                        default=100,
-                        type=int,
-                        help="Number of training cycles",
-                        )
-
-    parser.add_argument("--tune",
-                        default=True,
-                        type=bool,
-                        help="Tune model hyperparameters",
-                        )
-
-    parser.add_argument("--save",
-                        default=True,
-                        type=bool,
-                        help="Option to save model",
-                        )
-
-    args = parser.parse_args(argv)
-
-    dataset_path = pathlib.Path(DATASET_DIR, args.dataset)
-    dataset_name = dataset_path.name
+def main():
+    """
+    Main running function to train/tune a classifier and/or make predictions
+    """
+    dataset_path = DATASET_DIR / DATASET_NAME
     if not pathlib.Path.is_dir(dataset_path):
-        raise NotADirectoryError(f"Dataset {args.dataset} not found in {DATASET_DIR}")
+        raise NotADirectoryError(f"Dataset {DATASET_NAME} not found in {DATASET_DIR}")
 
-    ds, class_names = get_file_dataset(dataset_path)
-    train_ds, test_ds = split_dataset(ds, split=0.9)
+    dataset, class_names = get_file_dataset(dataset_path)
+    train_set, test_set = split_dataset(dataset, split=0.9)
+    dataset = configure_img_dataset(dataset, class_names)
+    test_set = configure_img_dataset(test_set, class_names)
 
-    model = train(train_ds, class_names, val_split=0.85, epochs=args.epochs, tune=args.tune, model_name=dataset_name)
+    if PREDICT_ONLY:
+        model_paths = list(MODEL_DIR.glob(f"{DATASET_NAME}_*"))
 
-    test_ds = configure_img_dataset(test_ds, class_names)
-    test_loss, test_acc = model.evaluate(test_ds, verbose=2)
-    print(f"\nTest accuracy: {round(test_acc * 100, 2)}%")
+        if not model_paths:
+            raise FileNotFoundError(
+                f"No model found for dataset '{DATASET_NAME}' in {DATASET_DIR}, please train a model first"
+            )
 
-    if args.save:
-        # Saving
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        save_name = "_".join((dataset_name, timestamp))
-        model.save(pathlib.Path(MODEL_DIR, save_name))
+        # Defaults to latest model
+        model = tf.keras.models.load_model(model_paths[-1])
+    else:
+        model = train(train_set, class_names, val_split=0.85, epochs=MAX_EPOCHS, tune=TUNE_MODEL, model_name=DATASET_NAME)
+
+        if SAVE_MODEL:
+            # Saving
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            save_name = "_".join((DATASET_NAME, timestamp))
+            model.save(pathlib.Path(MODEL_DIR, save_name))
+
+    _, test_acc = model.evaluate(test_set, verbose=0)
+    print(f"Test accuracy: {round(test_acc * 100, 2)}%")
+    _, dataset_acc = model.evaluate(dataset, verbose=0)
+    print(f"Dataset accuracy: {round(dataset_acc * 100, 2)}%")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import os
 import pathlib
+import tensorflow as tf
 
 # Paths
 parent_path = pathlib.Path(os.path.dirname(__file__))
@@ -11,6 +12,8 @@ SEED = 0
 # Model
 BATCH_SIZE = 32
 IMG_SIZE = (256, 256, 3)
+
+tf.random.set_seed(SEED)
 
 MODELS = [f.name for f in MODEL_DIR.iterdir() if f.is_dir()]
 DATASETS = [f.name for f in DATASET_DIR.iterdir() if f.is_dir()]
