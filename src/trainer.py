@@ -5,11 +5,18 @@ import keras_tuner as kt
 import tensorflow as tf
 import numpy as np
 from datetime import datetime
+from functools import partial
+from typing import Any
 from src.settings import MODEL_DIR, DATASET_DIR, IMG_SIZE, BATCH_SIZE, SEED
 
 
-def get_model_config(hp: kt.HyperParameters()):
-
+def get_model_config(hp: kt.HyperParameters()) -> dict[str, Any]:
+    """
+    Get model configuration parameters, returns values selected from each hyperparameter when called within a tuning
+        loop, otherwise returns default values
+    :param hp: HyperParameters object
+    :return: Dictionary of model configuration parameters
+    """
     hp.Int("conv_kernel_size", 3, 7, step=2, default=3),
     hp.Choice("layer1_units", [64, 128], default=128),
     hp.Choice("dropout", [0.25, 0.5], default=0.5),
@@ -19,37 +26,38 @@ def get_model_config(hp: kt.HyperParameters()):
     return config
 
 
-def tune_wrapper(hp: kt.HyperParameters()):
-
-    # TODO: Hardcoding
+def tune_build_wrapper(hp: kt.HyperParameters(), *args, **kwargs) -> tf.keras.Sequential:
+    """
+    Wrapper around build_model function allow hyperparameter tuning, additional arguments passed directly to build_model
+    :param hp: HyperParameters object
+    :return: Compiled model
+    """
     config = get_model_config(hp)
-    model = create_model(config, 17)
+    model = build_model(config, *args, **kwargs)
     return model
 
 
-def create_model(config, num_classes: int) -> tf.keras.Sequential:
+def build_model(config, num_classes: int) -> tf.keras.Sequential:
 
-    conv_layer = tf.keras.layers.Conv2D(
-            filters=32,
-            kernel_size=config["conv_kernel_size"],
-            strides=1,
-            padding="SAME",
-            activation="relu")
-    pool_layer = tf.keras.layers.MaxPooling2D(pool_size=2)
+    conv_layer = partial(tf.keras.layers.Conv2D,
+                         kernel_size=config["conv_kernel_size"],
+                         strides=1,
+                         padding="SAME",
+                         activation="relu")
 
     model = tf.keras.Sequential([
         tf.keras.layers.Rescaling(1./255),
-        conv_layer,
-        pool_layer,
-        conv_layer,
-        pool_layer,
-        conv_layer,
-        pool_layer,
-        conv_layer,
-        pool_layer,
+        conv_layer(filters=16),
+        tf.keras.layers.MaxPooling2D(pool_size=2),
+        conv_layer(filters=32),
+        tf.keras.layers.MaxPooling2D(pool_size=2),
+        conv_layer(filters=64),
+        tf.keras.layers.MaxPooling2D(pool_size=2),
+        conv_layer(filters=128),
+        tf.keras.layers.MaxPooling2D(pool_size=2),
         tf.keras.layers.Flatten(),  # Reshape layers to single array
         tf.keras.layers.Dense(config["layer1_units"], activation="relu"),  # Fully connected layer
-        tf.keras.layers.Dropout(config["dropout"]),  # 50% dropout to avoid over fitting
+        tf.keras.layers.Dropout(config["dropout"]),  # Dropout to avoid over fitting
         tf.keras.layers.Dense(num_classes),  # Fully connected layer with number of nodes = number of classes
         tf.keras.layers.Softmax()  # Normalise output to class probabilities
     ])
@@ -63,7 +71,7 @@ def create_model(config, num_classes: int) -> tf.keras.Sequential:
 
 def split_dataset(dataset: tf.data.Dataset, split: float = 0.8) -> (tf.data.Dataset, tf.data.Dataset):
     """
-    Split full dataset by
+    Split full dataset into two partitions, defined by input fraction
     :param dataset: Full dataset
     :param split: Fraction to split dataset between 0 and 1
     :return: split dataset 1, split dataset 2
@@ -81,34 +89,11 @@ def split_dataset(dataset: tf.data.Dataset, split: float = 0.8) -> (tf.data.Data
     return left_ds, right_ds
 
 
-def partition_ds(dataset: tf.data.Dataset, train_split: float = 0.7, val_split: float = 0.2, test_split: float = 0.1):
-    """
-    Split full dataset into train, validate, test subsets
-    :param dataset: Full dataset
-    :param train_split: Fraction of full dataset to use for training
-    :param val_split: Fraction of full dataset to use for validation
-    :param test_split: Fraction of full dataset to use for testing
-    :return: train, validation, test datasets
-    """
-    assert (train_split + test_split + val_split) == 1
-
-    ds_size = len(dataset)
-
-    train_size = int(train_split * ds_size)
-    val_size = int(val_split * ds_size)
-
-    train_ds = dataset.take(train_size)
-    val_ds = dataset.skip(train_size).take(val_size)
-    test_ds = dataset.skip(train_size).skip(val_size)
-
-    return train_ds, val_ds, test_ds
-
-
-def preprocess_img_path(file_path, class_names: np.array) -> (tf.Tensor, tf.int64):
+def preprocess_img_path(file_path: pathlib.Path, class_names: np.array) -> (tf.Tensor, tf.int64):
     """
     Preprocess an image loaded from an on-disk dataset
     :param file_path: Path to image file
-    :param class_names: Dataset class names
+    :param class_names: Numpy array of class names
     :return: formatted image, class label
     """
 
@@ -131,7 +116,14 @@ def preprocess_img_path(file_path, class_names: np.array) -> (tf.Tensor, tf.int6
     return format_img(), get_label()
 
 
-def configure_dataset_performance(dataset: tf.data.Dataset) -> tf.data.Dataset:
+def configure_img_dataset(dataset: tf.data.Dataset, class_names: np.array) -> tf.data.Dataset:
+    """
+    Configure file based image dataset with loading/preprocessing functionality and performance
+    :param dataset: File based image dataset
+    :param class_names: Numpy array of class names
+    :return: Configured dataset
+    """
+    dataset = dataset.map(lambda x: preprocess_img_path(x, class_names), num_parallel_calls=tf.data.AUTOTUNE)
     dataset = dataset.cache()
     dataset = dataset.shuffle(buffer_size=1000)
     dataset = dataset.batch(BATCH_SIZE)
@@ -139,66 +131,58 @@ def configure_dataset_performance(dataset: tf.data.Dataset) -> tf.data.Dataset:
     return dataset
 
 
-def train(dataset_path: pathlib.Path, epochs: int = 10, tune=True) -> None:
+def train(full_set: tf.data.Dataset,
+          class_names: np.array,
+          val_split: float = 0.8,
+          epochs: int = 10,
+          tune: bool = False,
+          model_name: str = "unnamed_model",
+          ) -> tf.keras.Sequential:
 
-    print(f"Getting data from {dataset_path}")
-    ds, class_names = get_data(dataset_path)
+    train_set, val_set = split_dataset(full_set, split=val_split)
+    train_set = configure_img_dataset(train_set, class_names)
+    val_set = configure_img_dataset(val_set, class_names)
 
-    full_train_ds, test_ds = split_dataset(ds, split=0.9)
-    train_ds, val_ds = split_dataset(full_train_ds, split=0.85)
-
-    train_ds = train_ds.map(lambda x: preprocess_img_path(x, class_names), num_parallel_calls=tf.data.AUTOTUNE)
-    val_ds = val_ds.map(lambda x: preprocess_img_path(x, class_names), num_parallel_calls=tf.data.AUTOTUNE)
-    test_ds = test_ds.map(lambda x: preprocess_img_path(x, class_names), num_parallel_calls=tf.data.AUTOTUNE)
-
-    train_ds = configure_dataset_performance(train_ds)
-    val_ds = configure_dataset_performance(val_ds)
-    test_ds = configure_dataset_performance(test_ds)
     val_loss_stop = tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=5)
 
     if tune:
         tuner = kt.RandomSearch(
-            tune_wrapper,
+            partial(tune_build_wrapper, num_classes=len(class_names)),
             objective="val_loss",
             max_trials=10,
             directory=MODEL_DIR,
-            project_name=f"{dataset_path.name}_tuned")
+            project_name=f"{model_name}_tuned")
 
-        tuner.search(train_ds, validation_data=val_ds, epochs=epochs, callbacks=[val_loss_stop])
+        tuner.search(train_set, validation_data=val_set, epochs=epochs, callbacks=[val_loss_stop])
         model = tuner.get_best_models()[0]
 
         # Retraining on full dataset
         loss_stop = tf.keras.callbacks.EarlyStopping(monitor="loss", patience=10)
 
-        full_train_ds = full_train_ds.map(lambda x: preprocess_img_path(x, class_names),
-                                          num_parallel_calls=tf.data.AUTOTUNE)
-
-        print("Retraining best model on full dataset")
-        full_train_ds = configure_dataset_performance(full_train_ds)
-        model.fit(full_train_ds, epochs=epochs, callbacks=[loss_stop])
+        print("Retraining best model on full dataset:")
+        full_set = configure_img_dataset(full_set, class_names)
+        model.fit(full_set, epochs=epochs, callbacks=[loss_stop])
     else:
         config = get_model_config(kt.HyperParameters())
-        model = create_model(config, len(class_names))
-        model.fit(train_ds, validation_data=val_ds, epochs=epochs, callbacks=[val_loss_stop])
+        model = build_model(config, len(class_names))
+        model.fit(train_set, validation_data=val_set, epochs=epochs, callbacks=[val_loss_stop])
 
-    test_loss, test_acc = model.evaluate(test_ds, verbose=2)
-    print(f"\nTest accuracy: {round(test_acc * 100, 2)}%")
-
-    # Saving
-    pathlib.Path.mkdir(pathlib.Path(MODEL_DIR), exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    model_name = "_".join((dataset_path.name, timestamp))
-    model.save(pathlib.Path(MODEL_DIR, model_name))
+    return model
 
 
-def get_data(dataset_path: pathlib.Path):
-
-    list_ds = tf.data.Dataset.list_files(str(dataset_path.joinpath("*", "*")), shuffle=False)
-    list_ds = list_ds.shuffle(len(list_ds), seed=SEED)
+def get_file_dataset(dataset_path: pathlib.Path) -> (tf.data.Dataset, list[str]):
+    """
+    Get file list dataset from input path, assumes immediate subdirectories contain individual classes
+    :param dataset_path: Path to dataset
+    :return: dataset, names of each class (subdirectory names)
+    """
+    print(f"Getting data from {dataset_path}")
+    dataset = tf.data.Dataset.list_files(str(dataset_path.joinpath("*", "*")), shuffle=False)
+    dataset = dataset.shuffle(len(dataset), seed=SEED)
 
     class_names = np.array(sorted([item.name for item in dataset_path.glob("*") if os.path.isdir(item)]))
 
-    return list_ds, class_names
+    return dataset, class_names
 
 
 def main(argv=None):
@@ -214,16 +198,42 @@ def main(argv=None):
     parser.add_argument("--epochs",
                         default=100,
                         type=int,
-                        help=f"Number of training cycles",
+                        help="Number of training cycles",
+                        )
+
+    parser.add_argument("--tune",
+                        default=True,
+                        type=bool,
+                        help="Tune model hyperparameters",
+                        )
+
+    parser.add_argument("--save",
+                        default=True,
+                        type=bool,
+                        help="Option to save model",
                         )
 
     args = parser.parse_args(argv)
 
     dataset_path = pathlib.Path(DATASET_DIR, args.dataset)
+    dataset_name = dataset_path.name
     if not pathlib.Path.is_dir(dataset_path):
         raise NotADirectoryError(f"Dataset {args.dataset} not found in {DATASET_DIR}")
 
-    train(dataset_path, epochs=args.epochs)
+    ds, class_names = get_file_dataset(dataset_path)
+    train_ds, test_ds = split_dataset(ds, split=0.9)
+
+    model = train(train_ds, class_names, val_split=0.85, epochs=args.epochs, tune=args.tune, model_name=dataset_name)
+
+    test_ds = configure_img_dataset(test_ds, class_names)
+    test_loss, test_acc = model.evaluate(test_ds, verbose=2)
+    print(f"\nTest accuracy: {round(test_acc * 100, 2)}%")
+
+    if args.save:
+        # Saving
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        save_name = "_".join((dataset_name, timestamp))
+        model.save(pathlib.Path(MODEL_DIR, save_name))
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import pathlib
 parent_path = pathlib.Path(os.path.dirname(__file__))
 DATASET_DIR = parent_path.joinpath("../datasets").resolve()
 MODEL_DIR = parent_path.joinpath("../saved_models").resolve()
+pathlib.Path.mkdir(pathlib.Path(MODEL_DIR), exist_ok=True)
 
 SEED = 0
 # Model
