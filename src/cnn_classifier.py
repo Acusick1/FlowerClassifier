@@ -10,12 +10,51 @@ from src.settings import MODEL_DIR, DATASET_DIR, IMG_SIZE, BATCH_SIZE, SEED
 
 # Running options
 DATASET_NAME = "Flowers"    # Name of dataset with the data directory
-PREDICT_ONLY = False        # Use existing model to make prediction or train new model
+EVAL_ONLY = True           # Evaluate existing model or train new model
 SAVE_MODEL = True           # Save the newly trained model
 TUNE_MODEL = True           # Tune model hyperparameters or train a single model
 MAX_EPOCHS = 100            # Maximum number of epochs per training cycle
 TEST_SPLIT = 0.1            # Fraction of full dataset to be used for testing
 VAL_SPLIT = 0.15            # Fraction of training dataset (after testing split) to be used for validation
+
+
+def save_model(model: tf.keras.Sequential, name: str):
+    """
+    Saves model in consistent timestamped format
+    :param model: Model to save
+    :param name: Name of model (will be appended with timestamp)
+    :return:
+    """
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    save_name = "_".join((name, timestamp))
+    model.save(pathlib.Path(MODEL_DIR, save_name))
+
+
+def get_model(name: str, latest: bool = False):
+    """
+    Retrieve model for model directory
+    :param name: Name or pattern to search for within model directory
+    :param latest: Whether to select the latest model (assumes saved using save_model function)
+    :return: model
+    """
+    if not latest:
+        # Load named model directly
+        model_path = MODEL_DIR / name
+    else:
+        # Not sorted by default
+        model_paths = list(sorted(MODEL_DIR.glob(name)))
+
+        if not model_paths:
+            raise FileNotFoundError(
+                f"No model named '{name}' found in {MODEL_DIR}, please train a model first"
+            )
+
+        model_path = model_paths[-1]
+
+    print(f"Loading model for prediction: {model_path}")
+    model = tf.keras.models.load_model(model_path)
+
+    return model
 
 
 def get_model_config(hp: kt.HyperParameters()) -> dict[str, Any]:
@@ -102,31 +141,37 @@ def split_dataset(dataset: tf.data.Dataset, split: float = 0.8) -> (tf.data.Data
     return left_ds, right_ds
 
 
-def preprocess_img_path(file_path: pathlib.Path, class_names: np.array) -> (tf.Tensor, tf.int64):
+def format_file_img(file_path: str):
     """
-    Preprocess an image loaded from an on-disk dataset
+    Read and format an image from a file
+    :param file_path: Path to file, specified as a string to allow use in tensorflow dataset mapping
+    :return: formatted image
+    """
+    img = tf.io.read_file(file_path)
+    img = tf.io.decode_image(img, channels=IMG_SIZE[-1], expand_animations=False)
+    img = tf.image.resize(img, IMG_SIZE[:2])
+    return img
+
+
+def preprocess_dataset_img(file_path: str, class_names: np.array) -> (tf.Tensor, tf.int64):
+    """
+    Preprocess an image loaded from an on-disk dataset to be used in training/testing of a model, requires both input
+        data and label to be returned
     :param file_path: Path to image file
     :param class_names: Numpy array of class names
     :return: formatted image, class label
     """
 
-    def format_img():
-        # Load the raw data from the file as a string
-        img = tf.io.read_file(file_path)
-        img = tf.io.decode_image(img, channels=IMG_SIZE[-1], expand_animations=False)
-        img = tf.image.resize(img, IMG_SIZE[:2])
-        return img
-
     def get_label():
         # Convert the path to a list of path components
         parts = tf.strings.split(file_path, os.path.sep)
-        # The second to last is the class-directory
+        # File parent directory name is the class name
         one_hot = parts[-2] == class_names
         # Integer encode the label
         label = tf.argmax(one_hot)
         return label
 
-    return format_img(), get_label()
+    return format_file_img(file_path), get_label()
 
 
 def configure_img_dataset(dataset: tf.data.Dataset, class_names: np.array, shuffle: bool = True) -> tf.data.Dataset:
@@ -137,7 +182,7 @@ def configure_img_dataset(dataset: tf.data.Dataset, class_names: np.array, shuff
     :param shuffle: Option to randomise dataset, True by default
     :return: Configured dataset
     """
-    dataset = dataset.map(lambda x: preprocess_img_path(x, class_names), num_parallel_calls=tf.data.AUTOTUNE)
+    dataset = dataset.map(lambda x: preprocess_dataset_img(x, class_names), num_parallel_calls=tf.data.AUTOTUNE)
 
     if shuffle:
         dataset = dataset.shuffle(buffer_size=1000, seed=SEED)
@@ -197,45 +242,48 @@ def train(full_set: tf.data.Dataset,
     return model
 
 
-def get_file_dataset(dataset_path: pathlib.Path) -> (tf.data.Dataset, list[str]):
+def get_file_dataset(dataset_path: pathlib.Path) -> tf.data.Dataset:
     """
     Get file list dataset from input path, assumes immediate subdirectories contain individual classes
     :param dataset_path: Path to dataset
-    :return: dataset, names of each class (subdirectory names)
+    :return: combined dataset
     """
     print(f"Getting data from {dataset_path}")
     dataset = tf.data.Dataset.list_files(str(dataset_path.joinpath("*", "*")), shuffle=False)
 
+    return dataset
+
+
+def get_file_dataset_classes(dataset_path: pathlib.Path) -> np.array:
+    """
+    Get file list dataset from input path, assumes immediate subdirectories contain individual classes
+    :param dataset_path: Path to dataset
+    :return: names of each class (subdirectory names)
+    """
     class_names = np.array(sorted([item.name for item in dataset_path.glob("*") if os.path.isdir(item)]))
 
-    return dataset, class_names
+    return class_names
 
 
 def main():
     """
-    Main running function to train/tune a classifier and/or make predictions
+    Main running function to train/tune/evaluate a classifier
     """
+    # Gather data
     dataset_path = DATASET_DIR / DATASET_NAME
     if not pathlib.Path.is_dir(dataset_path):
         raise NotADirectoryError(f"Dataset {DATASET_NAME} not found in {DATASET_DIR}")
 
-    dataset, class_names = get_file_dataset(dataset_path)
+    full_set = get_file_dataset(dataset_path)
+    class_names = get_file_dataset_classes(dataset_path)
+
     # Shuffle to ensure varied train and test sets
-    dataset = dataset.shuffle(len(dataset), seed=SEED)
-    test_set, train_set = split_dataset(dataset, split=TEST_SPLIT)
+    full_set = full_set.shuffle(len(full_set), seed=SEED)
+    test_set, train_set = split_dataset(full_set, split=TEST_SPLIT)
 
-    if PREDICT_ONLY:
-        # Not sorted by default
-        model_paths = list(sorted(MODEL_DIR.glob(f"{DATASET_NAME}_*")))
-        latest_model = model_paths[-1]
+    if EVAL_ONLY:
 
-        if not model_paths:
-            raise FileNotFoundError(
-                f"No model found for dataset '{DATASET_NAME}' in {DATASET_DIR}, please train a model first"
-            )
-
-        print(f"Loading model for prediction: {latest_model}")
-        model = tf.keras.models.load_model(latest_model)
+        model = get_model(f"{DATASET_NAME}*", latest=True)
     else:
         model = train(train_set,
                       class_names=class_names,
@@ -245,17 +293,21 @@ def main():
                       model_name=DATASET_NAME)
 
         if SAVE_MODEL:
-            # Saving
-            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            save_name = "_".join((DATASET_NAME, timestamp))
-            model.save(pathlib.Path(MODEL_DIR, save_name))
+            save_model(model, DATASET_NAME)
 
-    dataset = configure_img_dataset(dataset, class_names, shuffle=False)
-    test_set = configure_img_dataset(test_set, class_names, shuffle=False)
-    _, test_acc = model.evaluate(test_set, verbose=0)
-    print(f"Test accuracy: {round(test_acc * 100, 2)}%")
-    _, dataset_acc = model.evaluate(dataset, verbose=0)
-    print(f"Dataset accuracy: {round(dataset_acc * 100, 2)}%")
+    # Evaluate model
+    eval_sets = {"Test set": test_set, "Full dataset": full_set}
+
+    for name, dataset in eval_sets.items():
+        dataset = configure_img_dataset(dataset, class_names, shuffle=False)
+
+        label_idx = np.concatenate([l for _, l in dataset], axis=0)
+        predictions = model.predict(dataset, verbose=0)
+        confusion_matrix = tf.math.confusion_matrix(label_idx, tf.argmax(predictions, axis=1))
+        print(f"{name} confusion matrix: \n {confusion_matrix}")
+
+        _, test_acc = model.evaluate(dataset, verbose=0)
+        print(f"{name} accuracy: {round(test_acc * 100, 2)}%")
 
 
 if __name__ == "__main__":
