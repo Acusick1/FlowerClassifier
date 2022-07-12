@@ -10,12 +10,12 @@ from src.settings import MODEL_DIR, DATASET_DIR, IMG_SIZE, BATCH_SIZE, SEED
 
 # Running options
 DATASET_NAME = "Flowers"    # Name of dataset with the data directory
-EVAL_ONLY = True           # Evaluate existing model or train new model
+EVAL_ONLY = True            # Evaluate existing model or train new model
 SAVE_MODEL = True           # Save the newly trained model
 TUNE_MODEL = True           # Tune model hyperparameters or train a single model
 MAX_EPOCHS = 100            # Maximum number of epochs per training cycle
 TEST_SPLIT = 0.1            # Fraction of full dataset to be used for testing
-VAL_SPLIT = 0.15            # Fraction of training dataset (after testing split) to be used for validation
+VAL_SPLIT = 0.2             # Fraction of training dataset (after testing split) to be used for validation
 
 
 def save_model(model: tf.keras.Sequential, name: str):
